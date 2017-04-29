@@ -259,7 +259,8 @@ class DepthmapEstimator {
   }
 
   float PatchVariance(int i, int j) {
-    float patch[patch_size_ * patch_size_];
+    //float patch[patch_size_ * patch_size_];
+	std::vector<float> patch(patch_size_ * patch_size_);
     int hpz = (patch_size_ - 1) / 2;
     int counter = 0;
     for (int u = -hpz; u <= hpz; ++u) {
@@ -267,7 +268,7 @@ class DepthmapEstimator {
         patch[counter++] = images_[0].at<unsigned char>(i + u, j + v);
       }
     }
-    return Variance(patch, patch_size_ * patch_size_);
+    return Variance(patch.data(), patch_size_ * patch_size_);
   }
 
 
