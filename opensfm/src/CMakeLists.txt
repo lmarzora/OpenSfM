@@ -10,8 +10,8 @@ endif()
 
 set(CMAKE_MODULE_PATH ${opensfm_SOURCE_DIR}/cmake)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC -msse -msse2 -msse3")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC -msse -msse2 -msse3")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fPIC")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
 
 
 # Find dependencies.
@@ -84,11 +84,11 @@ endif ()
 add_definitions(-D__SSE2__)
 add_definitions(-D__SSE3__)
 add_definitions(-DVL_DISABLE_AVX)
-add_library(vl ${VLFEAT_SRCS})
+add_library(vl SHARED ${VLFEAT_SRCS})
 
 
 # Python wrapper
-add_library(csfm csfm.cc)
+add_library(csfm SHARED csfm.cc)
 target_link_libraries(csfm
     ${OpenCV_LIBS}
     ${GFLAGS_LIBRARY}
@@ -102,7 +102,7 @@ target_link_libraries(csfm
 )
 set_target_properties(csfm PROPERTIES
     PREFIX ""
-    SUFFIX ".lib"
+    SUFFIX ".pyd"
     LIBRARY_OUTPUT_DIRECTORY "${opensfm_SOURCE_DIR}/.."
 )
 if(APPLE)
