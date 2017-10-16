@@ -82,6 +82,10 @@ def shot_from_json(key, obj, cameras):
         shot.covariance = np.array(obj['covariance'])
     if 'merge_cc' in obj:
         shot.merge_cc = obj['merge_cc']
+    if 'vertices' in obj and 'faces' in obj:
+        shot.mesh = types.ShotMesh()
+        shot.mesh.vertices = obj['vertices']
+        shot.mesh.faces = obj['faces']
 
     return shot
 
@@ -374,12 +378,23 @@ def mkdir_p(path):
             raise
 
 
-def json_dump(data, fout, minify=False, codec='utf-8'):
+def json_dump_kwargs(minify=False, codec='utf-8'):
     if minify:
-        indent, separators = None, (',',':')
+        indent, separators = None, (',', ':')
     else:
         indent, separators = 4, None
-    return json.dump(data, fout, indent=indent, ensure_ascii=False, encoding=codec, separators=separators)
+    return dict(indent=indent, ensure_ascii=False,
+                encoding=codec, separators=separators)
+
+
+def json_dump(data, fout, minify=False, codec='utf-8'):
+    kwargs = json_dump_kwargs(minify, codec)
+    return json.dump(data, fout, **kwargs)
+
+
+def json_dumps(data, minify=False, codec='utf-8'):
+    kwargs = json_dump_kwargs(minify, codec)
+    return json.dumps(data, **kwargs)
 
 
 def json_loads(text, codec='utf-8'):

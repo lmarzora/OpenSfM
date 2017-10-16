@@ -66,7 +66,7 @@ class DataSet:
         return self.image_files[image]
 
     def load_image(self, image):
-        return open(self.__image_file(image))
+        return open(self.__image_file(image), 'rb')
 
     def image_as_array(self, image):
         """Return image pixels as 3-dimensional numpy array (R G B order)"""
@@ -133,6 +133,19 @@ class DataSet:
     def load_clean_depthmap(self, image):
         o = np.load(self._depthmap_file(image, 'clean.npz'))
         return o['depth'], o['plane'], o['score']
+
+    def pruned_depthmap_exists(self, image):
+        return os.path.isfile(self._depthmap_file(image, 'pruned.npz'))
+
+    def save_pruned_depthmap(self, image, points, normals, colors):
+        io.mkdir_p(self._depthmap_path())
+        filepath = self._depthmap_file(image, 'pruned.npz')
+        np.savez_compressed(filepath,
+                            points=points, normals=normals, colors=colors)
+
+    def load_pruned_depthmap(self, image):
+        o = np.load(self._depthmap_file(image, 'pruned.npz'))
+        return o['points'], o['normals'], o['colors']
 
     @staticmethod
     def __is_image_file(filename):
@@ -205,12 +218,12 @@ class DataSet:
 
         :param image: Image name, with extension (i.e. 123.jpg)
         """
-        with open(self.__exif_file(image), 'r') as fin:
+        with open(self.__exif_file(image), 'rb') as fin:
             return json.load(fin)
 
     def save_exif(self, image, data):
         io.mkdir_p(self.__exif_path())
-        with open(self.__exif_file(image), 'w') as fout:
+        with open(self.__exif_file(image), 'wb') as fout:
             io.json_dump(data, fout)
 
     def feature_type(self):
@@ -234,15 +247,16 @@ class DataSet:
     def __save_features(self, filepath, image, points, descriptors, colors=None):
         io.mkdir_p(self.__feature_path())
         feature_type = self.config.get('feature_type')
-        if ((feature_type == 'AKAZE' and self.config.get('akaze_descriptor') in ['MLDB_UPRIGHT', 'MLDB']) or
-            (feature_type == 'HAHOG' and self.config.get('hahog_normalize_to_uchar', False))):
+        if ((feature_type == 'AKAZE' and self.config.get('akaze_descriptor') in ['MLDB_UPRIGHT', 'MLDB'])
+                or (feature_type == 'HAHOG' and self.config.get('hahog_normalize_to_uchar', False))
+                or (feature_type == 'ORB')):
             feature_data_type = np.uint8
         else:
             feature_data_type = np.float32
         np.savez_compressed(filepath,
-                 points=points.astype(np.float32),
-                 descriptors=descriptors.astype(feature_data_type),
-                 colors=colors)
+                            points=points.astype(np.float32),
+                            descriptors=descriptors.astype(feature_data_type),
+                            colors=colors)
 
     def features_exist(self, image):
         return os.path.isfile(self.__feature_file(image))
@@ -348,6 +362,9 @@ class DataSet:
         """Return path of reconstruction file"""
         return os.path.join(self.data_path, filename or 'reconstruction.json')
 
+    def reconstruction_exists(self, filename=None):
+        return os.path.isfile(self.__reconstruction_file(filename))
+
     def load_reconstruction(self, filename=None):
         with open(self.__reconstruction_file(filename)) as fin:
             reconstructions = io.reconstructions_from_json(json.load(fin))
@@ -398,6 +415,9 @@ class DataSet:
         with open(self.__reference_lla_path(), 'r') as fin:
             return json.load(fin)
 
+    def reference_lla_exists(self):
+        return os.path.isfile(self.__reference_lla_path())
+
     def __camera_models_file(self):
         """Return path of camera model file"""
         return os.path.join(self.data_path, 'camera_models.json')
@@ -439,13 +459,13 @@ class DataSet:
         with open(self.__navigation_graph_file(), 'w') as fout:
             io.json_dump(navigation_graphs, fout)
 
-    def __ply_file(self):
-        return os.path.join(self.data_path, 'reconstruction.ply')
+    def __ply_file(self, filename):
+        return os.path.join(self.data_path, filename or 'reconstruction.ply')
 
-    def save_ply(self, reconstruction):
+    def save_ply(self, reconstruction, filename=None):
         """Save a reconstruction in PLY format"""
         ply = io.reconstruction_to_ply(reconstruction)
-        with open(self.__ply_file(), 'w') as fout:
+        with open(self.__ply_file(filename), 'w') as fout:
             fout.write(ply)
 
     def __ground_control_points_file(self):

@@ -1,4 +1,5 @@
 import logging
+from multiprocessing import Pool
 
 import cv2
 import numpy as np
@@ -32,41 +33,66 @@ class Command:
         urec = types.Reconstruction()
         urec.points = reconstruction.points
 
+        logger.debug('Undistorting the reconstruction')
+        undistorted_shots = {}
         for shot in reconstruction.shots.values():
             if shot.camera.projection_type == 'perspective':
-                image = data.image_as_array(shot.id)
-                undistorted = undistort_image(image, shot.camera)
-                data.save_undistorted_image(shot.id, undistorted)
-
                 urec.add_camera(shot.camera)
                 urec.add_shot(shot)
+                undistorted_shots[shot.id] = [shot]
             elif shot.camera.projection_type == 'fisheye':
-                image = data.image_as_array(shot.id)
-                undistorted = undistort_fisheye_image(image, shot.camera)
-                data.save_undistorted_image(shot.id, undistorted)
-
                 shot.camera = perspective_camera_from_fisheye(shot.camera)
                 urec.add_camera(shot.camera)
                 urec.add_shot(shot)
+                undistorted_shots[shot.id] = [shot]
             elif shot.camera.projection_type in ['equirectangular', 'spherical']:
-                original = data.image_as_array(shot.id)
-                width = int(data.config['depthmap_resolution'])
-                height = width / 2
-                image = cv2.resize(original, (width, height), interpolation=cv2.INTER_AREA)
-                shots = perspective_views_of_a_panorama(shot, width)
-                for subshot in shots:
+                subshot_width = int(data.config['depthmap_resolution'])
+                subshots = perspective_views_of_a_panorama(shot, subshot_width)
+                for subshot in subshots:
                     urec.add_camera(subshot.camera)
                     urec.add_shot(subshot)
-                    undistorted = render_perspective_view_of_a_panorama(
-                        image, shot, subshot)
-                    data.save_undistorted_image(subshot.id, undistorted)
-
                     add_subshot_tracks(graph, shot, subshot)
-
+                undistorted_shots[shot.id] = subshots
         data.save_undistorted_reconstruction([urec])
 
+        arguments = []
+        for shot in reconstruction.shots.values():
+            arguments.append((shot, undistorted_shots[shot.id], data))
 
-def undistort_image(image, camera):
+        processes = data.config['processes']
+        if processes == 1:
+            for arg in arguments:
+                undistort_image(arg)
+        else:
+            p = Pool(processes)
+            p.map(undistort_image, arguments)
+
+
+def undistort_image(arguments):
+    shot, undistorted_shots, data = arguments
+    logger.debug('Undistorting image {}'.format(shot.id))
+
+    if shot.camera.projection_type == 'perspective':
+        image = data.image_as_array(shot.id)
+        undistorted = undistort_perspective_image(image, shot.camera)
+        data.save_undistorted_image(shot.id, undistorted)
+    elif shot.camera.projection_type == 'fisheye':
+        image = data.image_as_array(shot.id)
+        undistorted = undistort_fisheye_image(image, shot.camera)
+        data.save_undistorted_image(shot.id, undistorted)
+    elif shot.camera.projection_type in ['equirectangular', 'spherical']:
+        original = data.image_as_array(shot.id)
+        subshot_width = int(data.config['depthmap_resolution'])
+        width = 4 * subshot_width
+        height = width / 2
+        image = cv2.resize(original, (width, height), interpolation=cv2.INTER_AREA)
+        for subshot in undistorted_shots:
+            undistorted = render_perspective_view_of_a_panorama(
+                image, shot, subshot)
+            data.save_undistorted_image(subshot.id, undistorted)
+
+
+def undistort_perspective_image(image, camera):
     """Remove radial distortion from a perspective image."""
     height, width = image.shape[:2]
     K = camera.get_K_in_pixel_coordinates(width, height)
@@ -167,6 +193,8 @@ def render_perspective_view_of_a_panorama(image, panoshot, perspectiveshot):
 
 def add_subshot_tracks(graph, panoshot, perspectiveshot):
     """Add edges between subshots and visible tracks."""
+    if panoshot.id not in graph:
+        return
     graph.add_node(perspectiveshot.id, bipartite=0)
     for track in graph[panoshot.id]:
         edge = graph[panoshot.id][track]
