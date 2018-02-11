@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 
-from distutils.core import setup
+#from distutils.core import setup
+from setuptools import setup
 import sys
 import os
 import errno
 import subprocess
 
-
+"""
 def mkdir_p(path):
     '''Make a directory including parent directories.
     '''
@@ -24,6 +25,7 @@ print "Compiling extension..."
 subprocess.Popen(['make','-j4'], cwd='cmake_build').wait()
 
 print "Building package"
+"""
 setup(
     name='OpenSfM',
     version='0.1',
@@ -31,9 +33,8 @@ setup(
     url='https://github.com/mapillary/OpenSfM',
     author='Mapillary',
     license='BSD',
-    packages=['opensfm', 'opensfm.commands'],
-    scripts=['bin/opensfm_run_all', 'bin/opensfm'],
-    package_data={
-        'opensfm': ['csfm.so', 'data/sensor_data.json']
-    },
+    scripts=['bin/opensfm_run_all', 'bin/opensfm', 'bin/export_bundler'],
+	packages=['opensfm', 'opensfm.commands', 'opensfm.large'],
+    #package_dir={'opensfm':  'opensfm/src/build/Release', 'opensfm.commands': 'opensfm/src' },
+	package_data={'opensfm': ['csfm.pyd', 'data/sensor_data.json']}
 )
