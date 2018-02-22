@@ -20,5 +20,7 @@ data/berlin/*
 # Ignore virtualenv files
 env/*
 
+OpenSfM.egg-info
 dist
 opensfm/src/build
+opensfm/csfm.pyd
