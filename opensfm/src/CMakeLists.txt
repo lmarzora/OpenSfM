@@ -63,7 +63,7 @@ else()
 endif()
 
 find_package(Boost REQUIRED COMPONENTS ${BOOST_PYTHON_COMPONENT})
-
+include_directories(${Boost_INCLUDE_DIR})
 if(${Boost_VERSION} LESS 106300)
     message("Not using boost/python/numpy.")
     set(USE_BOOST_PYTHON_NUMPY "off")
@@ -141,6 +141,7 @@ else()
     )
 endif()
 
+add_definitions(-D_USE_MATH_DEFINES)
 
 # Tests
 option(OPENSFM_BUILD_TESTS "Build OpenSfM unit tests." off)
