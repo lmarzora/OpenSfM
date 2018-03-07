@@ -7,7 +7,6 @@ import numpy as np
 import cv2
 
 from opensfm import transformations as tf
-from opensfm import csfm
 
 
 def nullspace(A):
@@ -106,15 +105,32 @@ def rq(A):
 
 
 def vector_angle(u, v):
-    '''
-    >>> u = [ 0.99500417 -0.33333333 -0.09983342]
-    >>> v = [ 0.99500417 -0.33333333 -0.09983342]
+    """Angle between two vectors.
+
+    >>> u = [ 0.99500417, -0.33333333, -0.09983342]
+    >>> v = [ 0.99500417, -0.33333333, -0.09983342]
     >>> vector_angle(u, v)
     0.0
-    '''
-    cos = np.dot(u, v) / math.sqrt(np.dot(u,u) * np.dot(v,v))
-    if cos >= 1.0: return 0.0
-    else: return math.acos(cos)
+    """
+    cos = np.dot(u, v) / math.sqrt(np.dot(u, u) * np.dot(v, v))
+    if cos >= 1.0:
+        return 0.0
+    else:
+        return math.acos(cos)
+
+
+def vector_angle_many(u, v):
+    """Angles between to lists of vectors.
+
+    >>> u = [[0.99500417, -0.33333333, -0.09983342], [0, -1, 0], [0, 1, 0]]
+    >>> v = [[0.99500417, -0.33333333, -0.09983342], [0, +1, 0], [0, 0, 1]]
+    >>> angles = vector_angle_many(u, v)
+    >>> np.allclose(angles, [0., 3.1416, 1.5708])
+    True
+    """
+    ua = np.array(u, dtype=np.float64, copy=False).reshape(-1, 3)
+    va = np.array(v, dtype=np.float64, copy=False).reshape(-1, 3)
+    return tf.angle_between_vectors(ua, va, axis=1)
 
 
 def decompose_similarity_transform(T):
@@ -142,8 +158,13 @@ def ransac(kernel, threshold):
     >>> x = np.array([1., 2., 3.])
     >>> y = np.array([2., 4., 7.])
     >>> kernel = TestLinearKernel(x, y)
-    >>> ransac(kernel, 0.1)
-    (2.0, array([0, 1]), 0.10000000000000001)
+    >>> model, inliers, error = ransac(kernel, 0.1)
+    >>> np.allclose(model, 2.0)
+    True
+    >>> inliers
+    array([0, 1])
+    >>> np.allclose(error, 0.1)
+    True
     '''
     max_iterations = 1000
     best_error = float('inf')
@@ -154,7 +175,7 @@ def ransac(kernel, threshold):
         try:
             samples = kernel.sampling()
         except AttributeError:
-            samples = random.sample(xrange(kernel.num_samples()),
+            samples = random.sample(range(kernel.num_samples()),
                                 kernel.required_samples)
         models = kernel.fit(samples)
         for model in models:
@@ -180,8 +201,9 @@ class TestLinearKernel:
     >>> models = kernel.fit([0])
     >>> models
     [2.0]
-    >>> kernel.evaluate(models[0])
-    array([ 0.,  0.,  1.])
+    >>> errors = kernel.evaluate(models[0])
+    >>> np.allclose(errors, [0., 0., 1.])
+    True
     '''
     required_samples = 1
 
@@ -220,10 +242,10 @@ class PlaneKernel:
     def sampling(self):
         samples = {}
         if len(self.vectors)>0:
-            samples['points'] = self.points[random.sample(xrange(len(self.points)), 2),:]
-            samples['vectors'] = [self.vectors[i] for i in random.sample(xrange(len(self.vectors)), 1)]
+            samples['points'] = self.points[random.sample(range(len(self.points)), 2), :]
+            samples['vectors'] = [self.vectors[i] for i in random.sample(range(len(self.vectors)), 1)]
         else:
-            samples['points'] = self.points[:,random.sample(xrange(len(self.points)), 3)]
+            samples['points'] = self.points[:, random.sample(range(len(self.points)), 3)]
             samples['vectors'] = None
         return samples
 
@@ -331,7 +353,7 @@ def fit_similarity_transform(p1, p2, max_iterations=1000, threshold=1):
 
     best_inliers= 0
 
-    for i in xrange(max_iterations):
+    for i in range(max_iterations):
 
         rnd = np.random.permutation(num_points)
         rnd = rnd[0:dim]
@@ -449,3 +471,63 @@ def rotation_matrix_from_up_vector_and_compass(up_vector, compass_angle):
 
     compass_rotation = cv2.Rodrigues(np.radians([0.0, 0.0, compass_angle]))[0]
     return np.column_stack([r1, r2, r3]).dot(compass_rotation)
+
+
+def motion_from_plane_homography(H):
+    """Compute candidate camera motions from a plane-induced homography.
+
+    Returns up to 8 motions.
+    The homography is assumed to be in normalized camera coordinates.
+
+    Uses the method of [Faugueras and Lustman 1988]
+
+    [Faugueras and Lustman 1988] Faugeras, Olivier, and F. Lustman.
+    “Motion and Structure from Motion in a Piecewise Planar Environment.”
+    Report. INRIA, June 1988. https://hal.inria.fr/inria-00075698/document
+    """
+
+    u, l, vh = np.linalg.svd(H)
+    d1, d2, d3 = l
+    s = np.linalg.det(u) * np.linalg.det(vh)
+
+    # Skip the cases where some singular values are nearly equal
+    if d1 / d2 < 1.0001 or d2 / d3 < 1.0001:
+        return []
+
+    abs_x1 = np.sqrt((d1**2 - d2**2) / (d1**2 - d3**2))
+    abs_x3 = np.sqrt((d2**2 - d3**2) / (d1**2 - d3**2))
+    possible_x1_x3 = [(abs_x1, abs_x3), (abs_x1, -abs_x3),
+                      (-abs_x1, abs_x3), (-abs_x1, -abs_x3)]
+    solutions = []
+
+    # Case d' > 0
+    for x1, x3 in possible_x1_x3:
+        sin_theta = (d1 - d3) * x1 * x3 / d2
+        cos_theta = (d1 * x3**2 + d3 * x1**2) / d2
+        Rp = np.array([[cos_theta, 0, -sin_theta],
+                       [0, 1, 0],
+                       [sin_theta, 0, cos_theta]])
+        tp = (d1 - d3) * np.array([x1, 0, -x3])
+        np_ = np.array([x1, 0, x3])
+        R = s * np.dot(np.dot(u, Rp), vh)
+        t = np.dot(u, tp)
+        n = -np.dot(vh.T, np_)
+        d = s * d2
+        solutions.append((R, t, n, d))
+
+    # Case d' < 0
+    for x1, x3 in possible_x1_x3:
+        sin_phi = (d1 + d3) * x1 * x3 / d2
+        cos_phi = (d3 * x1**2 - d1 * x3**2) / d2
+        Rp = np.array([[cos_phi, 0, sin_phi],
+                       [0, -1, 0],
+                       [sin_phi, 0, -cos_phi]])
+        tp = (d1 + d3) * np.array([x1, 0, x3])
+        np_ = np.array([x1, 0, x3])
+        R = s * np.dot(np.dot(u, Rp), vh)
+        t = np.dot(u, tp)
+        n = -np.dot(vh.T, np_)
+        d = -s * d2
+        solutions.append((R, t, n, d))
+
+    return solutions

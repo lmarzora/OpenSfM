@@ -1,13 +1,15 @@
 import logging
-from multiprocessing import Pool
 
 import cv2
 import numpy as np
 
 from opensfm import dataset
 from opensfm import features
+from opensfm import log
 from opensfm import transformations as tf
 from opensfm import types
+from opensfm.context import parallel_map
+
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +42,24 @@ class Command:
                 urec.add_camera(shot.camera)
                 urec.add_shot(shot)
                 undistorted_shots[shot.id] = [shot]
+            elif shot.camera.projection_type == 'brown':
+                ushot = types.Shot()
+                ushot.id = shot.id
+                ushot.camera = perspective_camera_from_brown(shot.camera)
+                ushot.pose = shot.pose
+                ushot.metadata = shot.metadata
+                urec.add_camera(ushot.camera)
+                urec.add_shot(ushot)
+                undistorted_shots[shot.id] = [ushot]
             elif shot.camera.projection_type == 'fisheye':
-                shot.camera = perspective_camera_from_fisheye(shot.camera)
-                urec.add_camera(shot.camera)
-                urec.add_shot(shot)
-                undistorted_shots[shot.id] = [shot]
+                ushot = types.Shot()
+                ushot.id = shot.id
+                ushot.camera = perspective_camera_from_fisheye(shot.camera)
+                ushot.pose = shot.pose
+                ushot.metadata = shot.metadata
+                urec.add_camera(ushot.camera)
+                urec.add_shot(ushot)
+                undistorted_shots[shot.id] = [ushot]
             elif shot.camera.projection_type in ['equirectangular', 'spherical']:
                 subshot_width = int(data.config['depthmap_resolution'])
                 subshots = perspective_views_of_a_panorama(shot, subshot_width)
@@ -60,21 +75,23 @@ class Command:
             arguments.append((shot, undistorted_shots[shot.id], data))
 
         processes = data.config['processes']
-        if processes == 1:
-            for arg in arguments:
-                undistort_image(arg)
-        else:
-            p = Pool(processes)
-            p.map(undistort_image, arguments)
+        parallel_map(undistort_image, arguments, processes)
 
 
 def undistort_image(arguments):
+    log.setup()
+
     shot, undistorted_shots, data = arguments
     logger.debug('Undistorting image {}'.format(shot.id))
 
     if shot.camera.projection_type == 'perspective':
         image = data.image_as_array(shot.id)
         undistorted = undistort_perspective_image(image, shot.camera)
+        data.save_undistorted_image(shot.id, undistorted)
+    elif shot.camera.projection_type == 'brown':
+        image = data.image_as_array(shot.id)
+        new_camera = undistorted_shots[0].camera
+        undistorted = undistort_brown_image(image, shot.camera, new_camera)
         data.save_undistorted_image(shot.id, undistorted)
     elif shot.camera.projection_type == 'fisheye':
         image = data.image_as_array(shot.id)
@@ -84,12 +101,16 @@ def undistort_image(arguments):
         original = data.image_as_array(shot.id)
         subshot_width = int(data.config['depthmap_resolution'])
         width = 4 * subshot_width
-        height = width / 2
+        height = width // 2
         image = cv2.resize(original, (width, height), interpolation=cv2.INTER_AREA)
         for subshot in undistorted_shots:
             undistorted = render_perspective_view_of_a_panorama(
                 image, shot, subshot)
             data.save_undistorted_image(subshot.id, undistorted)
+    else:
+        raise NotImplementedError(
+            'Undistort not implemented for projection type: {}'.format(
+                shot.camera.projection_type))
 
 
 def undistort_perspective_image(image, camera):
@@ -100,12 +121,33 @@ def undistort_perspective_image(image, camera):
     return cv2.undistort(image, K, distortion)
 
 
+def undistort_brown_image(image, camera, new_camera):
+    """Remove radial distortion from a brown image."""
+    height, width = image.shape[:2]
+    K = camera.get_K_in_pixel_coordinates(width, height)
+    distortion = np.array([camera.k1, camera.k2, camera.p1, camera.p2, camera.k3])
+    new_K = new_camera.get_K_in_pixel_coordinates(width, height)
+    return cv2.undistort(image, K, distortion, new_K)
+
+
 def undistort_fisheye_image(image, camera):
-    """Remove radial distortion from a perspective image."""
+    """Remove radial distortion from a fisheye image."""
     height, width = image.shape[:2]
     K = camera.get_K_in_pixel_coordinates(width, height)
     distortion = np.array([camera.k1, camera.k2, 0, 0])
-    return cv2.fisheye.undistortImage(image, K, distortion, K)
+    return cv2.fisheye.undistortImage(image, K, distortion, Knew=K)
+
+
+def perspective_camera_from_brown(brown):
+    """Create a perspective camera froma a Brown camera."""
+    camera = types.PerspectiveCamera()
+    camera.id = brown.id
+    camera.width = brown.width
+    camera.height = brown.height
+    camera.focal = (brown.focal_x + brown.focal_y) / 2.0
+    camera.focal_prior = (brown.focal_x_prior + brown.focal_y_prior) / 2.0
+    camera.k1 = camera.k1_prior = camera.k2 = camera.k2_prior = 0.0
+    return camera
 
 
 def perspective_camera_from_fisheye(fisheye):
@@ -166,7 +208,7 @@ def render_perspective_view_of_a_panorama(image, panoshot, perspectiveshot):
         perspectiveshot.camera.height)
 
     # Convert to bearing
-    dst_bearings = perspectiveshot.camera.pixel_bearings(dst_pixels)
+    dst_bearings = perspectiveshot.camera.pixel_bearing_many(dst_pixels)
 
     # Rotate to panorama reference frame
     rotation = np.dot(panoshot.pose.get_rotation_matrix(),
@@ -182,12 +224,13 @@ def render_perspective_view_of_a_panorama(image, panoshot, perspectiveshot):
     src_pixels_denormalized = features.denormalized_image_coordinates(
         src_pixels, image.shape[1], image.shape[0])
 
+    src_pixels_denormalized.shape = dst_shape + (2,)
+
     # Sample color
-    colors = cv2.remap(image,
-                       src_pixels_denormalized[:, 0].astype(np.float32),
-                       src_pixels_denormalized[:, 1].astype(np.float32),
-                       cv2.INTER_LINEAR)
-    colors.shape = dst_shape + (-1,)
+    x = src_pixels_denormalized[..., 0].astype(np.float32)
+    y = src_pixels_denormalized[..., 1].astype(np.float32)
+    colors = cv2.remap(image, x, y, cv2.INTER_LINEAR)
+
     return colors
 
 

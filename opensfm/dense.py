@@ -1,12 +1,14 @@
 
 import logging
-from multiprocessing import Pool
 
 import cv2
 import numpy as np
 
 from opensfm import csfm
+from opensfm import io
+from opensfm import log
 from opensfm import matching
+from opensfm.context import parallel_map
 
 
 logger = logging.getLogger(__name__)
@@ -31,21 +33,21 @@ def compute_depthmaps(data, graph, reconstruction):
             continue
         min_depth, max_depth = compute_depth_range(graph, reconstruction, shot)
         arguments.append((data, neighbors[shot.id], min_depth, max_depth, shot))
-    parallel_run(compute_depthmap_catched, arguments, processes)
+    parallel_map(compute_depthmap_catched, arguments, processes)
 
     arguments = []
     for shot in reconstruction.shots.values():
         if len(neighbors[shot.id]) <= 1:
             continue
         arguments.append((data, neighbors[shot.id], shot))
-    parallel_run(clean_depthmap_catched, arguments, processes)
+    parallel_map(clean_depthmap_catched, arguments, processes)
 
     arguments = []
     for shot in reconstruction.shots.values():
         if len(neighbors[shot.id]) <= 1:
             continue
         arguments.append((data, neighbors[shot.id], shot))
-    parallel_run(prune_depthmap_catched, arguments, processes)
+    parallel_map(prune_depthmap_catched, arguments, processes)
 
     merge_depthmaps(data, graph, reconstruction, neighbors)
 
@@ -74,21 +76,10 @@ def prune_depthmap_catched(arguments):
         logger.exception(e)
 
 
-def parallel_run(function, arguments, num_processes):
-    """Run function for all arguments using multiple processes."""
-    num_processes = min(num_processes, len(arguments))
-    if num_processes == 1:
-        return [function(arg) for arg in arguments]
-    else:
-        p = Pool(num_processes)
-        ret = p.map(function, arguments)
-        p.close()
-        p.terminate()
-        return ret
-
-
 def compute_depthmap(arguments):
     """Compute depthmap for a single shot."""
+    log.setup()
+
     data, neighbors, min_depth, max_depth, shot = arguments
     method = data.config['depthmap_method']
 
@@ -110,7 +101,8 @@ def compute_depthmap(arguments):
     elif (method == 'PATCH_MATCH_SAMPLE'):
         depth, plane, score, nghbr = de.compute_patch_match_sample()
     else:
-        raise ValueError('Unknown depthmap method type ' \
+        raise ValueError(
+            'Unknown depthmap method type '
             '(must be BRUTE_FORCE, PATCH_MATCH or PATCH_MATCH_SAMPLE)')
 
     good_score = score > data.config['depthmap_min_correlation_score']
@@ -124,7 +116,7 @@ def compute_depthmap(arguments):
         image = data.undistorted_image_as_array(shot.id)
         image = scale_down_image(image, depth.shape[1], depth.shape[0])
         ply = depthmap_to_ply(shot, depth, image)
-        with open(data._depthmap_file(shot.id, 'raw.npz.ply'), 'w') as fout:
+        with io.open_wt(data._depthmap_file(shot.id, 'raw.npz.ply')) as fout:
             fout.write(ply)
 
     if data.config.get('interactive'):
@@ -149,6 +141,8 @@ def compute_depthmap(arguments):
 
 def clean_depthmap(arguments):
     """Clean depthmap by checking consistency with neighbors."""
+    log.setup()
+
     data, neighbors, shot = arguments
 
     if data.clean_depthmap_exists(shot.id):
@@ -170,7 +164,7 @@ def clean_depthmap(arguments):
         image = data.undistorted_image_as_array(shot.id)
         image = scale_down_image(image, depth.shape[1], depth.shape[0])
         ply = depthmap_to_ply(shot, depth, image)
-        with open(data._depthmap_file(shot.id, 'clean.npz.ply'), 'w') as fout:
+        with io.open_wt(data._depthmap_file(shot.id, 'clean.npz.ply')) as fout:
             fout.write(ply)
 
     if data.config.get('interactive'):
@@ -188,6 +182,8 @@ def clean_depthmap(arguments):
 
 def prune_depthmap(arguments):
     """Prune depthmap to remove redundant points."""
+    log.setup()
+
     data, neighbors, shot = arguments
 
     if data.pruned_depthmap_exists(shot.id):
@@ -205,7 +201,7 @@ def prune_depthmap(arguments):
 
     if data.config['depthmap_save_debug_files']:
         ply = point_cloud_to_ply(points, normals, colors)
-        with open(data._depthmap_file(shot.id, 'pruned.npz.ply'), 'w') as fout:
+        with io.open_wt(data._depthmap_file(shot.id, 'pruned.npz.ply')) as fout:
             fout.write(ply)
 
 
@@ -228,7 +224,7 @@ def merge_depthmaps(data, graph, reconstruction, neighbors):
     colors = np.concatenate(colors)
 
     ply = point_cloud_to_ply(points, normals, colors)
-    with open(data._depthmap_path() + '/merged.ply', 'w') as fout:
+    with io.open_wt(data._depthmap_path() + '/merged.ply') as fout:
         fout.write(ply)
 
 
@@ -241,7 +237,7 @@ def add_views_to_depth_estimator(data, neighbors, de):
         gray_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2GRAY)
         original_height, original_width = gray_image.shape
         width = int(data.config['depthmap_resolution'])
-        height = width * original_height / original_width
+        height = width * original_height // original_width
         image = scale_down_image(gray_image, width, height)
         K = shot.camera.get_K_in_pixel_coordinates(width, height)
         R = shot.pose.get_rotation_matrix()
@@ -353,20 +349,20 @@ def depthmap_to_ply(shot, depth, image):
 
     vertices = []
     for p, c in zip(points.T, image.reshape(-1, 3)):
-        s = "{} {} {} {} {} {}".format(p[0], p[1], p[2], c[0], c[1], c[2])
+        s = u"{} {} {} {} {} {}".format(p[0], p[1], p[2], c[0], c[1], c[2])
         vertices.append(s)
 
     header = [
-        "ply",
-        "format ascii 1.0",
-        "element vertex {}".format(len(vertices)),
-        "property float x",
-        "property float y",
-        "property float z",
-        "property uchar diffuse_red",
-        "property uchar diffuse_green",
-        "property uchar diffuse_blue",
-        "end_header",
+        u"ply",
+        u"format ascii 1.0",
+        u"element vertex {}".format(len(vertices)),
+        u"property float x",
+        u"property float y",
+        u"property float z",
+        u"property uchar diffuse_red",
+        u"property uchar diffuse_green",
+        u"property uchar diffuse_blue",
+        u"end_header",
     ]
 
     return '\n'.join(header + vertices + [''])
@@ -376,24 +372,24 @@ def point_cloud_to_ply(points, normals, colors):
     """Export depthmap points as a PLY string"""
     vertices = []
     for p, n, c in zip(points, normals, colors):
-        s = "{:.4f} {:.4f} {:.4f} {:.3f} {:.3f} {:.3f} {} {} {}".format(
+        s = u"{:.4f} {:.4f} {:.4f} {:.3f} {:.3f} {:.3f} {} {} {}".format(
             p[0], p[1], p[2], n[0], n[1], n[2], int(c[0]), int(c[1]), int(c[2]))
         vertices.append(s)
 
     header = [
-        "ply",
-        "format ascii 1.0",
-        "element vertex {}".format(len(vertices)),
-        "property float x",
-        "property float y",
-        "property float z",
-        "property float nx",
-        "property float ny",
-        "property float nz",
-        "property uchar diffuse_red",
-        "property uchar diffuse_green",
-        "property uchar diffuse_blue",
-        "end_header",
+        u"ply",
+        u"format ascii 1.0",
+        u"element vertex {}".format(len(vertices)),
+        u"property float x",
+        u"property float y",
+        u"property float z",
+        u"property float nx",
+        u"property float ny",
+        u"property float nz",
+        u"property uchar diffuse_red",
+        u"property uchar diffuse_green",
+        u"property uchar diffuse_blue",
+        u"end_header",
     ]
 
     return '\n'.join(header + vertices + [''])
