@@ -2,9 +2,11 @@
 import logging
 import os
 import sys
+import sys
+
 
 import cv2
-import sys
+from loky import get_reusable_executor
 
 if getattr( sys, 'frozen', False ) :
     # running in a bundle
@@ -31,7 +33,12 @@ else:
 # Parallel processes
 def parallel_map(func, args, num_proc):
     """Run function for all arguments using multiple processes."""
-    return list(map(func, args))
+    num_proc = min(num_proc, len(args))
+    if num_proc <= 1:
+        return list(map(func, args))
+    else:
+        with get_reusable_executor(max_workers=num_proc, timeout=None) as e:
+            return list(e.map(func, args))
 
 # Memory usage
 if sys.platform == 'darwin':

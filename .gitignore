@@ -9,7 +9,9 @@ launch.json
 # Ignore generated files
 /build
 /cmake_build
+/doc/build
 .cache
+.pytest_cache
 eval
 
 # Ignore the data folder, but not the berlin example.

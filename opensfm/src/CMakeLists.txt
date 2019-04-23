@@ -46,6 +46,8 @@ include_directories(${GLOG_INCLUDE_DIR})
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 
+find_package(Boost REQUIRED)
+
 option(BUILD_FOR_PYTHON3 "build pyopengv for Python 3" OFF)
 set(BOOST_PYTHON3_COMPONENT "python3" CACHE STRING
     "name of the Boost Python 3 component (python3, python-py36 or python-py37)")
@@ -56,17 +58,22 @@ if(${BUILD_FOR_PYTHON3})
     set(Python_ADDITIONAL_VERSIONS 3.7 3.6)
     set(Python_VERSION_SUFFIX 3)
 else()
-    set(BOOST_PYTHON_COMPONENT python)
-    set(BOOST_NUMPY_COMPONENT numpy)
+    if(${Boost_VERSION} LESS 106700)
+        set(BOOST_PYTHON_COMPONENT python)
+        set(BOOST_NUMPY_COMPONENT numpy)
+    else()
+        set(BOOST_PYTHON_COMPONENT python27)
+        set(BOOST_NUMPY_COMPONENT numpy27)
+    endif()
     set(Python_ADDITIONAL_VERSIONS 2.7)
     set(Python_VERSION_SUFFIX "")
 endif()
 
-find_package(Boost REQUIRED COMPONENTS ${BOOST_PYTHON_COMPONENT})
-include_directories(${Boost_INCLUDE_DIR})
 if(${Boost_VERSION} LESS 106300)
     message("Not using boost/python/numpy.")
     set(USE_BOOST_PYTHON_NUMPY "off")
+
+    find_package(Boost REQUIRED COMPONENTS ${BOOST_PYTHON_COMPONENT})
 else()
     message("Using boost/python/numpy.")
     set(USE_BOOST_PYTHON_NUMPY "on")
@@ -142,6 +149,12 @@ else()
 endif()
 
 add_definitions(-D_USE_MATH_DEFINES)
+
+add_executable(debug_c_extension
+    debug_c_extension.cc
+    third_party/PythonExtensionPatterns/py_import_call_execute.c
+)
+target_link_libraries(debug_c_extension ${PYTHON_LIBRARIES})
 
 # Tests
 option(OPENSFM_BUILD_TESTS "Build OpenSfM unit tests." off)

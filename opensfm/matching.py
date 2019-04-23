@@ -105,7 +105,7 @@ def robust_match_fundamental(p1, p2, matches, config):
     F, mask = cv2.findFundamentalMat(p1, p2, FM_RANSAC, threshold, 0.9999)
     inliers = mask.ravel().nonzero()
 
-    if F[2, 2] == 0.0:
+    if F is None or F[2, 2] == 0.0:
         return []
 
     return matches[inliers]
@@ -139,7 +139,8 @@ def robust_match_calibrated(p1, p2, camera1, camera2, matches, config):
     b2 = camera2.pixel_bearing_many(p2)
 
     threshold = config['robust_matching_calib_threshold']
-    T = pyopengv.relative_pose_ransac(b1, b2, "STEWENIUS", 1 - np.cos(threshold), 1000)
+    T = multiview.relative_pose_ransac(
+        b1, b2, "STEWENIUS", 1 - np.cos(threshold), 1000, 0.999)
 
     inliers = _compute_inliers_bearings(b1, b2, T, threshold)
 
@@ -153,9 +154,9 @@ def robust_match(p1, p2, camera1, camera2, matches, config):
     matrix is used.  Otherwise, we use the Essential matrix.
     """
     if (camera1.projection_type == 'perspective'
-            and camera1.k1 == 0.0
+            and camera1.k1 == 0.0 and camera1.k2 == 0.0
             and camera2.projection_type == 'perspective'
-            and camera2.k1 == 0.0):
+            and camera2.k1 == 0.0 and camera2.k2 == 0.0):
         return robust_match_fundamental(p1, p2, matches, config)
     else:
         return robust_match_calibrated(p1, p2, camera1, camera2, matches, config)

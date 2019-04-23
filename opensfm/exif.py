@@ -39,7 +39,7 @@ def get_tag_as_float(tags, key):
 
 
 def compute_focal(focal_35, focal, sensor_width, sensor_string):
-    if focal_35 > 0:
+    if focal_35 is not None and focal_35 > 0:
         focal_ratio = focal_35 / 36.0  # 35mm film produces 36x24mm pictures.
     else:
         if not sensor_width:
@@ -320,8 +320,8 @@ def hard_coded_calibration(exif):
         if 'hdr-as200v' == model:
             return {'focal': 0.55, 'k1': -0.30, 'k2': 0.08}
         elif 'hdr-as300' in model:
-            return {"focal": 0.405, "k1": -0.205, "k2": 0.075}
-
+            return {"focal":  0.3958, "k1": -0.1496, "k2": 0.0201}
+            
 
 def focal_ratio_calibration(exif):
     if exif['focal_ratio']:

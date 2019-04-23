@@ -3,22 +3,23 @@
 
 import datetime
 import logging
+from collections import defaultdict
 from itertools import combinations
 
-import numpy as np
 import cv2
+import numpy as np
 import pyopengv
 import six
 from timeit import default_timer as timer
 from six import iteritems
 
-from opensfm import align
 from opensfm import csfm
 from opensfm import geo
 from opensfm import log
 from opensfm import matching
 from opensfm import multiview
 from opensfm import types
+from opensfm.align import align_reconstruction, apply_similarity
 from opensfm.context import parallel_map, current_memory_usage
 
 
@@ -149,6 +150,8 @@ def bundle(graph, reconstruction, gcp, config):
         config['radial_distorsion_p2_sd'],
         config['radial_distorsion_k3_sd'])
     ba.set_num_threads(config['processes'])
+    ba.set_max_num_iterations(50)
+    ba.set_linear_solver_type("SPARSE_SCHUR")
 
     chrono.lap('setup')
     ba.run()
@@ -219,6 +222,8 @@ def bundle_single_view(graph, reconstruction, shot_id, config):
         config['radial_distorsion_p2_sd'],
         config['radial_distorsion_k3_sd'])
     ba.set_num_threads(config['processes'])
+    ba.set_max_num_iterations(10)
+    ba.set_linear_solver_type("DENSE_QR")
 
     ba.run()
 
@@ -234,7 +239,10 @@ def bundle_local(graph, reconstruction, gcp, central_shot_id, config):
     chrono = Chronometer()
 
     interior, boundary = shot_neighborhood(
-        graph, reconstruction, central_shot_id, config['local_bundle_radius'])
+        graph, reconstruction, central_shot_id,
+        config['local_bundle_radius'],
+        config['local_bundle_min_common_points'],
+        config['local_bundle_max_shots'])
 
     logger.debug(
         'Local bundle sets: interior {}  boundary {}  other {}'.format(
@@ -272,7 +280,7 @@ def bundle_local(graph, reconstruction, gcp, central_shot_id, config):
     for shot_id in interior | boundary:
         if shot_id in graph:
             for track in graph[shot_id]:
-                if track in reconstruction.points:
+                if track in point_ids:
                     ba.add_observation(str(shot_id), str(track),
                                        *graph[shot_id][track]['feature'])
 
@@ -306,6 +314,8 @@ def bundle_local(graph, reconstruction, gcp, central_shot_id, config):
         config['radial_distorsion_p2_sd'],
         config['radial_distorsion_k3_sd'])
     ba.set_num_threads(config['processes'])
+    ba.set_max_num_iterations(10)
+    ba.set_linear_solver_type("DENSE_SCHUR")
 
     chrono.lap('setup')
     ba.run()
@@ -337,39 +347,55 @@ def bundle_local(graph, reconstruction, gcp, central_shot_id, config):
     return report
 
 
-def shot_neighborhood(graph, reconstruction, central_shot_id, radius):
+def shot_neighborhood(graph, reconstruction, central_shot_id, radius,
+                      min_common_points, max_interior_size):
     """Reconstructed shots near a given shot.
 
     Returns:
         a tuple with interior and boundary:
         - interior: the list of shots at distance smaller than radius
-        - boundary: shots at distance radius
+        - boundary: shots sharing at least on point with the interior
 
     Central shot is at distance 0.  Shots at distance n + 1 share at least
-    one point with shots at distance n.
+    min_common_points points with shots at distance n.
     """
-    interior = set()
-    boundary = set([central_shot_id])
-    for distance in range(radius):
-        new_boundary = set()
-        for shot_id in boundary:
-            neighbors = shot_direct_neighbors(graph, reconstruction, shot_id)
-            for neighbor in neighbors:
-                if neighbor not in boundary and neighbor not in interior:
-                    new_boundary.add(neighbor)
-        interior.update(boundary)
-        boundary = new_boundary
+    max_boundary_size = 1000000
+    interior = set([central_shot_id])
+    for distance in range(1, radius):
+        remaining = max_interior_size - len(interior)
+        if remaining <= 0:
+            break
+        neighbors = direct_shot_neighbors(
+            graph, reconstruction, interior, min_common_points, remaining)
+        interior.update(neighbors)
+    boundary = direct_shot_neighbors(
+        graph, reconstruction, interior, 1, max_boundary_size)
     return interior, boundary
 
 
-def shot_direct_neighbors(graph, reconstruction, shot_id):
-    """Reconstructed shots sharing reconstructed points with a given shot."""
+def direct_shot_neighbors(graph, reconstruction, shot_ids,
+                          min_common_points, max_neighbors):
+    """Reconstructed shots sharing reconstructed points with a shot set."""
+    points = set()
+    for shot_id in shot_ids:
+        for track_id in graph[shot_id]:
+            if track_id in reconstruction.points:
+                points.add(track_id)
+
+    candidate_shots = set(reconstruction.shots) - set(shot_ids)
+    common_points = defaultdict(int)
+    for track_id in points:
+        for neighbor in graph[track_id]:
+            if neighbor in candidate_shots:
+                common_points[neighbor] += 1
+
+    pairs = sorted(common_points.items(), key=lambda x: -x[1])
     neighbors = set()
-    for track_id in graph[shot_id]:
-        if track_id in reconstruction.points:
-            for neighbor in graph[track_id]:
-                if neighbor in reconstruction.shots:
-                    neighbors.add(neighbor)
+    for neighbor, num_points in pairs[:max_neighbors]:
+        if num_points >= min_common_points:
+            neighbors.add(neighbor)
+        else:
+            break
     return neighbors
 
 
@@ -480,14 +506,6 @@ def _two_view_reconstruction_inliers(b1, b2, R, t, threshold):
     return np.nonzero(ok1 * ok2)[0]
 
 
-def run_relative_pose_ransac(b1, b2, method, threshold, iterations):
-    return pyopengv.relative_pose_ransac(b1, b2, method, threshold, iterations)
-
-
-def run_relative_pose_optimize_nonlinear(b1, b2, t, R):
-    return pyopengv.relative_pose_optimize_nonlinear(b1, b2, t, R)
-
-
 def two_view_reconstruction_plane_based(p1, p2, camera1, camera2, threshold):
     """Reconstruct two views from point correspondences lying on a plane.
 
@@ -539,13 +557,13 @@ def two_view_reconstruction(p1, p2, camera1, camera2, threshold):
     # Here we arbitrarily assume that the threshold is given for a camera of
     # focal length 1.  Also, arctan(threshold) \approx threshold since
     # threshold is small
-    T = run_relative_pose_ransac(
-        b1, b2, "STEWENIUS", 1 - np.cos(threshold), 1000)
+    T = multiview.relative_pose_ransac(
+        b1, b2, "STEWENIUS", 1 - np.cos(threshold), 1000, 0.999)
     R = T[:, :3]
     t = T[:, 3]
     inliers = _two_view_reconstruction_inliers(b1, b2, R, t, threshold)
 
-    T = run_relative_pose_optimize_nonlinear(b1[inliers], b2[inliers], t, R)
+    T = multiview.relative_pose_optimize_nonlinear(b1[inliers], b2[inliers], t, R)
     R = T[:, :3]
     t = T[:, 3]
     inliers = _two_view_reconstruction_inliers(b1, b2, R, t, threshold)
@@ -573,8 +591,8 @@ def two_view_reconstruction_rotation_only(p1, p2, camera1, camera2, threshold):
     b1 = camera1.pixel_bearing_many(p1)
     b2 = camera2.pixel_bearing_many(p2)
 
-    R = pyopengv.relative_pose_ransac_rotation_only(
-        b1, b2, 1 - np.cos(threshold), 1000)
+    R = multiview.relative_pose_ransac_rotation_only(
+        b1, b2, 1 - np.cos(threshold), 1000, 0.999)
     inliers = _two_view_rotation_inliers(b1, b2, R, threshold)
 
     return cv2.Rodrigues(R.T)[0].ravel(), inliers
@@ -655,10 +673,7 @@ def bootstrap_reconstruction(data, graph, im1, im2, p1, p2):
     shot2.metadata = get_image_metadata(data, im2)
     reconstruction.add_shot(shot2)
 
-    triangulate_shot_features(
-        graph, reconstruction, im1,
-        data.config['triangulation_threshold'],
-        data.config['triangulation_min_ray_angle'])
+    triangulate_shot_features(graph, reconstruction, im1, data.config)
 
     logger.info("Triangulated: {}".format(len(reconstruction.points)))
     report['triangulated_points'] = len(reconstruction.points)
@@ -695,14 +710,13 @@ def reconstructed_points_for_images(graph, reconstruction, images):
     return sorted(res, key=lambda x: -x[1])
 
 
-def resect(data, graph, reconstruction, shot_id):
+def resect(graph, reconstruction, shot_id,
+           camera, metadata, threshold, min_inliers):
     """Try resecting and adding a shot to the reconstruction.
 
     Return:
         True on success.
     """
-    exif = data.load_exif(shot_id)
-    camera = reconstruction.cameras[exif['camera']]
 
     bs = []
     Xs = []
@@ -717,9 +731,8 @@ def resect(data, graph, reconstruction, shot_id):
     if len(bs) < 5:
         return False, {'num_common_points': len(bs)}
 
-    threshold = data.config['resection_threshold']
-    T = pyopengv.absolute_pose_ransac(
-        bs, Xs, "KNEIP", 1 - np.cos(threshold), 1000)
+    T = multiview.absolute_pose_ransac(
+        bs, Xs, "KNEIP", 1 - np.cos(threshold), 1000, 0.999)
 
     R = T[:, :3]
     t = T[:, 3]
@@ -736,7 +749,7 @@ def resect(data, graph, reconstruction, shot_id):
         'num_common_points': len(bs),
         'num_inliers': ninliers,
     }
-    if ninliers >= data.config['resection_min_inliers']:
+    if ninliers >= min_inliers:
         R = T[:, :3].T
         t = -R.dot(T[:, 3])
         shot = types.Shot()
@@ -745,12 +758,47 @@ def resect(data, graph, reconstruction, shot_id):
         shot.pose = types.Pose()
         shot.pose.set_rotation_matrix(R)
         shot.pose.translation = t
-        shot.metadata = get_image_metadata(data, shot_id)
+        shot.metadata = metadata
         reconstruction.add_shot(shot)
-        bundle_single_view(graph, reconstruction, shot_id, data.config)
         return True, report
     else:
         return False, report
+
+
+def corresponding_tracks(tracks1, tracks2):
+    features1 = {tracks1[t1]["feature_id"]: t1 for t1 in tracks1}
+    corresponding_tracks = []
+    for t2 in tracks2:
+        feature_id = tracks2[t2]["feature_id"]
+        if feature_id in features1:
+            corresponding_tracks.append((features1[feature_id], t2))
+    return corresponding_tracks
+
+
+def compute_common_tracks(reconstruction1, reconstruction2,
+                          graph1, graph2):
+    common_tracks = set()
+    common_images = set(reconstruction1.shots.keys()).intersection(
+        reconstruction2.shots.keys())
+    for image in common_images:
+        for t1, t2 in corresponding_tracks(graph1[image], graph2[image]):
+            if t1 in reconstruction1.points and t2 in reconstruction2.points:
+                common_tracks.add((t1, t2))
+    return list(common_tracks)
+
+
+def resect_reconstruction(reconstruction1, reconstruction2, graph1,
+                          graph2, threshold, min_inliers):
+
+    common_tracks = compute_common_tracks(
+        reconstruction1, reconstruction2, graph1, graph2)
+    worked, similarity, inliers = align_two_reconstruction(
+        reconstruction1, reconstruction2, common_tracks, threshold)
+    if not worked:
+        return False, [], []
+
+    inliers = [common_tracks[inliers[i]] for i in range(len(inliers))]
+    return True, similarity, inliers
 
 
 class TrackTriangulator:
@@ -833,9 +881,11 @@ class TrackTriangulator:
             return r
 
 
-def triangulate_shot_features(graph, reconstruction, shot_id, reproj_threshold,
-                              min_ray_angle):
+def triangulate_shot_features(graph, reconstruction, shot_id, config):
     """Reconstruct as many tracks seen in shot_id as possible."""
+    reproj_threshold = config['triangulation_threshold']
+    min_ray_angle = config['triangulation_min_ray_angle']
+
     triangulator = TrackTriangulator(graph, reconstruction)
 
     for track in graph[shot_id]:
@@ -887,31 +937,38 @@ def shot_lla_and_compass(shot, reference):
     return lat, lon, alt, angle
 
 
-def merge_two_reconstructions(r1, r2, config, threshold=1):
-    """Merge two reconstructions with common tracks."""
+def align_two_reconstruction(r1, r2, common_tracks, threshold):
+    """Estimate similarity transform between two reconstructions."""
     t1, t2 = r1.points, r2.points
-    common_tracks = list(set(t1) & set(t2))
 
     if len(common_tracks) > 6:
+        p1 = np.array([t1[t[0]].coordinates for t in common_tracks])
+        p2 = np.array([t2[t[1]].coordinates for t in common_tracks])
 
-        # Estimate similarity transform
-        p1 = np.array([t1[t].coordinates for t in common_tracks])
-        p2 = np.array([t2[t].coordinates for t in common_tracks])
-
+        # 3 samples / 100 trials / 50% outliers = 0.99 probability
+        # with probability = 1-(1-(1-outlier)^model)^trial
         T, inliers = multiview.fit_similarity_transform(
-            p1, p2, max_iterations=1000, threshold=threshold)
+            p1, p2, max_iterations=100, threshold=threshold)
+        if len(inliers) > 0:
+            return True, T, inliers
+    return False, None, None
 
-        if len(inliers) >= 10:
-            s, A, b = multiview.decompose_similarity_transform(T)
-            r1p = r1
-            align.apply_similarity(r1p, s, A, b)
-            r = r2
-            r.shots.update(r1p.shots)
-            r.points.update(r1p.points)
-            align.align_reconstruction(r, None, config)
-            return [r]
-        else:
-            return [r1, r2]
+
+def merge_two_reconstructions(r1, r2, config, threshold=1):
+    """Merge two reconstructions with common tracks IDs."""
+    common_tracks = list(set(r1.points) & set(r2.points))
+    worked, T, inliers = align_two_reconstruction(
+        r1, r2, common_tracks, threshold)
+
+    if worked and len(inliers) >= 10:
+        s, A, b = multiview.decompose_similarity_transform(T)
+        r1p = r1
+        apply_similarity(r1p, s, A, b)
+        r = r2
+        r.shots.update(r1p.shots)
+        r.points.update(r1p.points)
+        align_reconstruction(r, None, config)
+        return [r]
     else:
         return [r1, r2]
 
@@ -963,17 +1020,18 @@ class ShouldBundle:
     def __init__(self, data, reconstruction):
         self.interval = data.config['bundle_interval']
         self.new_points_ratio = data.config['bundle_new_points_ratio']
-        self.done(reconstruction)
+        self.reconstruction = reconstruction
+        self.done()
 
-    def should(self, reconstruction):
+    def should(self):
         max_points = self.num_points_last * self.new_points_ratio
         max_shots = self.num_shots_last + self.interval
-        return (len(reconstruction.points) >= max_points or
-                len(reconstruction.shots) >= max_shots)
+        return (len(self.reconstruction.points) >= max_points or
+                len(self.reconstruction.shots) >= max_shots)
 
-    def done(self, reconstruction):
-        self.num_points_last = len(reconstruction.points)
-        self.num_shots_last = len(reconstruction.shots)
+    def done(self):
+        self.num_points_last = len(self.reconstruction.points)
+        self.num_shots_last = len(self.reconstruction.shots)
 
 
 class ShouldRetriangulate:
@@ -982,87 +1040,101 @@ class ShouldRetriangulate:
     def __init__(self, data, reconstruction):
         self.active = data.config['retriangulation']
         self.ratio = data.config['retriangulation_ratio']
-        self.done(reconstruction)
+        self.reconstruction = reconstruction
+        self.done()
 
-    def should(self, reconstruction):
+    def should(self):
         max_points = self.num_points_last * self.ratio
-        return self.active and len(reconstruction.points) > max_points
+        return self.active and len(self.reconstruction.points) > max_points
 
-    def done(self, reconstruction):
-        self.num_points_last = len(reconstruction.points)
+    def done(self):
+        self.num_points_last = len(self.reconstruction.points)
 
 
 def grow_reconstruction(data, graph, reconstruction, images, gcp):
     """Incrementally add shots to an initial reconstruction."""
-    bundle(graph, reconstruction, None, data.config)
-    align.align_reconstruction(reconstruction, gcp, data.config)
+    config = data.config
+    report = {'steps': []}
+
+    bundle(graph, reconstruction, None, config)
+    remove_outliers(graph, reconstruction, config)
+    align_reconstruction(reconstruction, gcp, config)
 
     should_bundle = ShouldBundle(data, reconstruction)
     should_retriangulate = ShouldRetriangulate(data, reconstruction)
-    report = {
-        'steps': [],
-    }
     while True:
-        if data.config['save_partial_reconstructions']:
+        if config['save_partial_reconstructions']:
             paint_reconstruction(data, graph, reconstruction)
             data.save_reconstruction(
                 [reconstruction], 'reconstruction.{}.json'.format(
                     datetime.datetime.now().isoformat().replace(':', '_')))
 
-        common_tracks = reconstructed_points_for_images(graph, reconstruction,
-                                                        images)
-        if not common_tracks:
+        candidates = reconstructed_points_for_images(
+            graph, reconstruction, images)
+        if not candidates:
             break
 
         logger.info("-------------------------------------------------------")
-        for image, num_tracks in common_tracks:
-            ok, resrep = resect(data, graph, reconstruction, image)
-            if ok:
-                logger.info("Adding {0} to the reconstruction".format(image))
-                step = {
-                    'image': image,
-                    'resection': resrep,
-                    'memory_usage': current_memory_usage()
-                }
-                report['steps'].append(step)
-                images.remove(image)
+        threshold = data.config['resection_threshold']
+        min_inliers = data.config['resection_min_inliers']
+        for image, num_tracks in candidates:
 
-                np_before = len(reconstruction.points)
-                triangulate_shot_features(
-                    graph, reconstruction, image,
-                    data.config['triangulation_threshold'],
-                    data.config['triangulation_min_ray_angle'])
-                np_after = len(reconstruction.points)
-                step['triangulated_points'] = np_after - np_before
+            camera = reconstruction.cameras[data.load_exif(image)['camera']]
+            metadata = get_image_metadata(data, image)
+            ok, resrep = resect(graph, reconstruction, image,
+                                camera, metadata, threshold, min_inliers)
+            if not ok:
+                continue
 
-                if should_bundle.should(reconstruction):
-                    brep = bundle(graph, reconstruction, None, data.config)
-                    step['bundle'] = brep
-                    remove_outliers(graph, reconstruction, data.config)
-                    align.align_reconstruction(reconstruction, gcp,
-                                               data.config)
-                    should_bundle.done(reconstruction)
-                else:
-                    if data.config['local_bundle_radius'] > 0:
-                        brep = bundle_local(graph, reconstruction, None, image,
-                                            data.config)
-                        step['local_bundle'] = brep
+            bundle_single_view(graph, reconstruction, image, data.config)
 
-                if should_retriangulate.should(reconstruction):
-                    logger.info("Re-triangulating")
-                    rrep = retriangulate(graph, reconstruction, data.config)
-                    step['retriangulation'] = rrep
-                    bundle(graph, reconstruction, None, data.config)
-                    should_retriangulate.done(reconstruction)
-                break
+            logger.info("Adding {0} to the reconstruction".format(image))
+            step = {
+                'image': image,
+                'resection': resrep,
+                'memory_usage': current_memory_usage()
+            }
+            report['steps'].append(step)
+            images.remove(image)
+
+            np_before = len(reconstruction.points)
+            triangulate_shot_features(graph, reconstruction, image, config)
+            np_after = len(reconstruction.points)
+            step['triangulated_points'] = np_after - np_before
+
+            if should_retriangulate.should():
+                logger.info("Re-triangulating")
+                b1rep = bundle(graph, reconstruction, None, config)
+                rrep = retriangulate(graph, reconstruction, config)
+                b2rep = bundle(graph, reconstruction, None, config)
+                remove_outliers(graph, reconstruction, config)
+                align_reconstruction(reconstruction, gcp, config)
+                step['bundle'] = b1rep
+                step['retriangulation'] = rrep
+                step['bundle_after_retriangulation'] = b2rep
+                should_retriangulate.done()
+                should_bundle.done()
+            elif should_bundle.should():
+                brep = bundle(graph, reconstruction, None, config)
+                remove_outliers(graph, reconstruction, config)
+                align_reconstruction(reconstruction, gcp, config)
+                step['bundle'] = brep
+                should_bundle.done()
+            elif config['local_bundle_radius'] > 0:
+                brep = bundle_local(graph, reconstruction, None, image, config)
+                remove_outliers(graph, reconstruction, config)
+                step['local_bundle'] = brep
+
+            break
         else:
             logger.info("Some images can not be added")
             break
 
     logger.info("-------------------------------------------------------")
 
-    bundle(graph, reconstruction, gcp, data.config)
-    align.align_reconstruction(reconstruction, gcp, data.config)
+    bundle(graph, reconstruction, gcp, config)
+    remove_outliers(graph, reconstruction, config)
+    align_reconstruction(reconstruction, gcp, config)
     paint_reconstruction(data, graph, reconstruction)
     return reconstruction, report
 

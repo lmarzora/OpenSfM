@@ -1,4 +1,8 @@
 from __future__ import absolute_import
+from __future__ import unicode_literals
+from __future__ import division
+from __future__ import print_function
+
 import errno
 import io
 import json
@@ -349,7 +353,7 @@ def cameras_to_json(cameras):
     return obj
 
 
-def _read_ground_control_points_list_line(line, projection, reference_lla, exif):
+def _read_gcp_list_line(line, projection, reference_lla, exif):
     words = line.split()
     easting, northing, alt, pixel_x, pixel_y = map(float, words[:5])
     shot_id = words[5]
@@ -387,7 +391,7 @@ def _parse_utm_projection_string(line):
         zone_number = int(zone[:-1])
         zone_hemisphere = 'north'
     elif zone[-1] == 'S':
-        zone_number = int(zone['-1'])
+        zone_number = int(zone[:-1])
         zone_hemisphere = 'south'
     else:
         zone_number = int(zone)
@@ -408,15 +412,21 @@ def _parse_projection(line):
         raise ValueError("Un-supported geo system definition: {}".format(line))
 
 
+def _valid_gcp_line(line):
+    stripped = line.strip()
+    return stripped and stripped[0] != '#'
+
+
 def read_ground_control_points_list(fileobj, reference_lla, exif):
     """Read a ground control point list file.
 
     It requires the points to be in the WGS84 lat, lon, alt format.
     """
-    lines = fileobj.readlines()
-    projection = _parse_projection(lines[0])
-    points = [_read_ground_control_points_list_line(line, projection, reference_lla, exif)
-              for line in lines[1:]]
+    all_lines = fileobj.readlines()
+    lines = iter(filter(_valid_gcp_line, all_lines))
+    projection = _parse_projection(next(lines))
+    points = [_read_gcp_list_line(line, projection, reference_lla, exif)
+              for line in lines]
     return points
 
 
@@ -440,7 +450,8 @@ def open_rt(path):
     return io.open(path, 'r', encoding='utf-8')
 
 
-def _json_dump_python_2_pached(obj, fp, skipkeys=False, ensure_ascii=True, check_circular=True,
+def _json_dump_python_2_pached(
+        obj, fp, skipkeys=False, ensure_ascii=True, check_circular=True,
         allow_nan=True, cls=None, indent=None, separators=None,
         encoding='utf-8', default=None, sort_keys=False, **kw):
     """Serialize ``obj`` as a JSON formatted stream to ``fp`` (a
@@ -494,14 +505,16 @@ def _json_dump_python_2_pached(obj, fp, skipkeys=False, ensure_ascii=True, check
     """
     # cached encoder
     if (not skipkeys and ensure_ascii and
-        check_circular and allow_nan and
-        cls is None and indent is None and separators is None and
-        encoding == 'utf-8' and default is None and not sort_keys and not kw):
+            check_circular and allow_nan and
+            cls is None and indent is None and separators is None and
+            encoding == 'utf-8' and default is None and not sort_keys and
+            not kw):
         iterable = json._default_encoder.iterencode(obj)
     else:
         if cls is None:
             cls = json.JSONEncoder
-        iterable = cls(skipkeys=skipkeys, ensure_ascii=ensure_ascii,
+        iterable = cls(
+            skipkeys=skipkeys, ensure_ascii=ensure_ascii,
             check_circular=check_circular, allow_nan=allow_nan, indent=indent,
             separators=separators, encoding=encoding,
             default=default, sort_keys=sort_keys, **kw).iterencode(obj)
@@ -563,8 +576,19 @@ def imread(filename):
                 "version 3.2 or newer.".format(cv2.__version__))
     else:
         flags = cv2.CV_LOAD_IMAGE_COLOR
+
     bgr = cv2.imread(filename, flags)
+
+    if bgr is None:
+        raise IOError("Unable to load image {}".format(filename))
+
     return bgr[:, :, ::-1]  # Turn BGR to RGB
+
+
+def imwrite(filename, image):
+    """Write an RGB image to a file"""
+    bgr = image[:, :, ::-1]
+    cv2.imwrite(filename, bgr)
 
 
 # Bundler
@@ -633,12 +657,12 @@ def export_bundler(image_list, reconstructions, track_graph, bundle_file_path,
 
         bundle_file = os.path.join(bundle_file_path,
                                    'bundle_r' + str(j).zfill(3) + '.out')
-        with open(bundle_file, 'wb') as fout:
+        with open_wt(bundle_file) as fout:
             fout.writelines('\n'.join(lines) + '\n')
 
         list_file = os.path.join(list_file_path,
                                  'list_r' + str(j).zfill(3) + '.out')
-        with open(list_file, 'wb') as fout:
+        with open_wt(list_file) as fout:
             fout.writelines('\n'.join(map(str, image_list)))
 
 
@@ -653,7 +677,7 @@ def import_bundler(data_path, bundle_file, list_file, track_file,
 
     # Copy image list.
     list_dir = os.path.dirname(list_file)
-    with open(list_file, 'rb') as fin:
+    with open_rt(list_file) as fin:
         lines = fin.read().splitlines()
     ordered_shots = []
     image_list = []
@@ -669,7 +693,7 @@ def import_bundler(data_path, bundle_file, list_file, track_file,
     if not bundle_file or not os.path.isfile(bundle_file):
         return None
 
-    with open(bundle_file, 'rb') as fin:
+    with open_rt(bundle_file) as fin:
         lines = fin.readlines()
     offset = 1 if '#' in lines[0] else 0
 
@@ -754,12 +778,12 @@ def import_bundler(data_path, bundle_file, list_file, track_file,
         offset += 3
 
     # save track file
-    with open(track_file, 'wb') as fout:
+    with open_wt(track_file) as fout:
         fout.writelines('\n'.join(track_lines))
 
     # save reconstruction
     if reconstruction_file is not None:
-        with open(reconstruction_file, 'wb') as fout:
+        with open_wt(reconstruction_file) as fout:
             obj = reconstructions_to_json([reconstruction])
             json_dump(obj, fout)
     return reconstruction
@@ -791,16 +815,16 @@ def reconstruction_to_ply(reconstruction, no_cameras=False, no_points=False):
                     vertices.append(s)
 
     header = [
-        u"ply",
-        u"format ascii 1.0",
-        u"element vertex {}".format(len(vertices)),
-        u"property float x",
-        u"property float y",
-        u"property float z",
-        u"property uchar diffuse_red",
-        u"property uchar diffuse_green",
-        u"property uchar diffuse_blue",
-        u"end_header",
+        "ply",
+        "format ascii 1.0",
+        "element vertex {}".format(len(vertices)),
+        "property float x",
+        "property float y",
+        "property float z",
+        "property uchar diffuse_red",
+        "property uchar diffuse_green",
+        "property uchar diffuse_blue",
+        "end_header",
     ]
 
     return '\n'.join(header + vertices + [''])
